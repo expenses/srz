@@ -11,6 +11,6 @@ edition = "2018"
 ignore = "*"
 toml = "*"
 pathdiff = "*"
-clap = {version = "*", features = ["yaml"]}
 read_input = "*"
 ansi_term = "*"
+structopt = "*"

@@ -1,22 +1,24 @@
 use ignore::Walk;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::BTreeMap;
 use std::path::{PathBuf, Path};
 use std::fs::{read, File};
-use clap::{App, Arg, SubCommand, ArgMatches};
 use read_input::prelude::*;
 use std::io::Write;
 use ansi_term::{Style, Colour};
+use structopt::StructOpt;
 
-type Descriptions = HashMap<PathBuf, String>;
+// Paths should be ordered
+type Descriptions = BTreeMap<PathBuf, String>;
 
+#[derive(Debug)]
 struct Sunrise {
     descriptions: Descriptions,
-    path: PathBuf,
-    root_path: PathBuf
+    file_path: PathBuf,
+    repo_path: PathBuf
 }
 
 impl Sunrise {
-    fn locate(start: &Path) -> Result<Self, Error> {
+    fn locate(start: &Path, verbose: bool) -> Result<Self, Error> {
         let mut current_dir = start.to_path_buf();
         let mut not_at_root = true;
 
@@ -33,40 +35,54 @@ impl Sunrise {
                     .and_then(|file| toml::from_slice(&file)
                     .map_err(Error::TomlDe))?;
 
-                return Ok(Sunrise {
-                    path,
+                let sunrise = Sunrise {
+                    file_path: path,
                     descriptions,
-                    root_path: current_dir
-                });
+                    repo_path: current_dir.canonicalize().map_err(Error::Io)?
+                };
+
+                if verbose {
+                    println!("Sunrise.file_path: {}", sunrise.file_path.display());
+                    println!("Sunrise.repo_path: {}", sunrise.repo_path.display());
+                    println!("#Sunrise.descriptions: {}", sunrise.descriptions.len());
+                    println!("-----")
+                }
+
+                return Ok(sunrise);
             }
 
             not_at_root = current_dir.pop();
         }
 
-        return Err(Error::Static(".sunrise not found"));
+        Err(Error::Static(".sunrise not found"))
     }
 
     fn save(&self) -> Result<(), Error> {
-        let mut file = File::create(&self.path).map_err(Error::Io)?;
+        let mut file = File::create(&self.file_path).map_err(Error::Io)?;
         let buffer = toml::to_vec(&self.descriptions).map_err(Error::TomlSer)?;
         file.write_all(&buffer).map_err(Error::Io)
     }
 
     fn relative(&self, path: &Path) -> PathBuf {
-        pathdiff::diff_paths(path, &self.root_path).unwrap()
+        pathdiff::diff_paths(&path.canonicalize().unwrap(), &self.repo_path).unwrap()
     }
 
-    fn add_description(&mut self, filename: &Path) -> Result<bool, Error> {
+    fn set_description(&mut self, filename: &Path, string: String) -> Result<(), Error> {
+        self.descriptions.insert(filename.to_path_buf(), string);
+        self.save()
+    }
+
+    fn add_description(&mut self, filename: &Path, text: &str) -> Result<bool, Error> {
         let string = read_input::InputBuilder::<String>::new()
             .msg(format!(
-                "{}: Add description or press enter to ignore: ",
-                Style::new().bold().paint(filename.display().to_string())
+                "{}: {}: ",
+                Style::new().bold().paint(filename.display().to_string()),
+                text
             ))
             .get();
 
         if !string.is_empty() {
-            self.descriptions.insert(filename.to_path_buf(), string);
-            self.save()?;
+            self.set_description(filename, string)?;
             Ok(true)
         } else {
             Ok(false)
@@ -80,21 +96,28 @@ impl Sunrise {
             .filter(|path| !path.as_os_str().is_empty())
     }
 
+    fn descripted(&self) -> Vec<PathBuf> {
+        self.descriptions.keys().map(PathBuf::clone).collect()
+    }
+
+    fn remove(&mut self, file: &PathBuf) -> Result<(), Error> {
+        self.descriptions.remove(file);
+        self.save()
+    }
+
     fn clean(&mut self) -> Result<bool, Error> {
-        let files: Vec<_> = self.descriptions.keys().map(|key| key.clone()).collect();
         let mut altered = false;
 
-        for file in files {
-            if !self.path.join(&file).exists() {
+        for file in self.descripted() {
+            if !self.repo_path.join(&file).exists() {
                 let input = read_input::InputBuilder::<Decision>::new()
                     .msg(&format!("{} no longer exists. Would you like to remove it? [Y/n]: ", file.display()))
                     .default(Decision::Yes)
                     .get();
 
                 if let Decision::Yes = input {
-                    self.descriptions.remove(&file);
+                    self.remove(&file)?;
                     altered = true;
-                    self.save()?;
                 }
             }
         }
@@ -123,101 +146,58 @@ impl std::str::FromStr for Decision {
     }
 }
 
+#[derive(StructOpt, Debug)]
+enum Subcommand {
+    Interactive {
+        directory: Option<PathBuf>,
+    },
+    Init {
+        directory: Option<PathBuf>,
+    },
+    Edit {
+        files: Vec<PathBuf>,
+    },
+    Review {
+        directory: Option<PathBuf>,
+    }
+}
+
+#[derive(StructOpt, Debug)]
+struct Opt {
+    #[structopt(subcommand)]
+    subcommand: Option<Subcommand>,
+    #[structopt(short, long)]
+    inline: bool,
+    #[structopt(short, long)]
+    verbose: bool,
+    directory: Option<PathBuf>
+}
+
 fn main() {
-    let matches = App::new("Sunrise")
-        .arg(Arg::with_name("DIRECTORY").takes_value(true))
-        .subcommand(SubCommand::with_name("init")
-            .about("Initialise sunrise in a directory")
-            .arg(Arg::with_name("DIRECTORY").takes_value(true))
-        )
-        .subcommand(SubCommand::with_name("interactive")
-            .about("Interactive mode")
-            .arg(Arg::with_name("DIRECTORY")
-                .takes_value(true)
-            )
-        )
-        .subcommand(SubCommand::with_name("edit")
-            .about("Edit or add a description for an file/directory")
-            .arg(Arg::with_name("FILE")
-                .required(true)
-                .takes_value(true)
-            )
-        )
-        .get_matches();
+    let opt = Opt::from_args();
+    if opt.verbose {
+        println!("{:?}", opt);
+    }
 
-    println!("{:?}", matches);
-
-    if let Err(error) = run(matches) {
+    if let Err(error) = run(opt) {
         println!("{}: {}", Style::new().bold().fg(Colour::Red).paint("Error"), error);
     }
 }
 
-fn run(matches: ArgMatches) -> Result<(), Error> {
-    if let Some(matches) = matches.subcommand_matches("init") {
-        subcommands::init(
-            directory_or_current(matches.value_of("DIRECTORY"))?
-        );
-    } else if let Some(matches) = matches.subcommand_matches("interactive") {
-        subcommands::interactive(
-            directory_or_current(matches.value_of("DIRECTORY"))?
-        ).unwrap();
-    } else if let Some(matches) = matches.subcommand_matches("edit") {
-        let filename = matches.value_of("FILE").map(Path::new).unwrap();
-        subcommands::edit(&filename)?;
-    } else {
-        subcommands::print(
-            directory_or_current(matches.value_of("DIRECTORY"))?
-        );
-    }
-
-    Ok(())
-}
-
-fn write_descriptions(descriptions: &Descriptions, path: &Path) -> Option<()> {
-    let mut file = File::create(&path.join(".sunrise")).ok()?;
-    let buffer = toml::to_vec(&descriptions).ok()?;
-    file.write_all(&buffer).ok()
-}
-
-fn entry_description(path: &Path) -> Option<String> {
-    let string = read_input::InputBuilder::<String>::new()
-        .msg(format!(
-            "{}: Add description or press enter to ignore: ",
-            Style::new().bold().paint(path.display().to_string())
-        ))
-        .get();
-
-    if !string.is_empty() {
-        Some(string)
-    } else {
-        None
+fn run(opt: Opt) -> Result<(), Error> {
+    match opt.subcommand {
+        None => subcommands::print(directory_or_current(opt.directory)?, opt.verbose, opt.inline),
+        Some(Subcommand::Init {directory}) => subcommands::init(directory_or_current(directory)?),
+        Some(Subcommand::Interactive {directory}) => subcommands::interactive(
+            directory_or_current(directory)?, opt.verbose
+        ),
+        Some(Subcommand::Review {directory}) => subcommands::review(directory_or_current(directory)?, opt.verbose),
+        Some(Subcommand::Edit {files}) => subcommands::edit(files, opt.verbose)
     }
 }
 
-fn sunrise_dir(directory: &Path) -> Result<PathBuf, Error> {
-    let mut current_dir = directory.to_path_buf();
-    let mut not_at_root = true;
-
-    while not_at_root {
-        let sunrise_path = current_dir.join(".sunrise");
-
-        if sunrise_path.exists() {
-            println!("{}", Style::new().bold().paint(
-                format!("Using {}", sunrise_path.display())
-            ));
-            return Ok(current_dir);
-        }
-
-        not_at_root = current_dir.pop();
-    }
-
-    return Err(Error::Static(".sunrise not found"));
-}
-
-fn directory_or_current(dir: Option<&str>) -> Result<PathBuf, Error> {
-    dir
-        .map(|dir| Ok(PathBuf::from(dir)))
-        .unwrap_or_else(|| std::env::current_dir().map_err(Error::Io))
+fn directory_or_current(dir: Option<PathBuf>) -> Result<PathBuf, Error> {
+    dir.map(Result::Ok).unwrap_or_else(|| std::env::current_dir().map_err(Error::Io))
 }
 
 #[derive(Debug)]

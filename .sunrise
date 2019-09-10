@@ -1,5 +1,5 @@
-src = "source directory"
-"src/main.rs" = "Program source code"
 "Cargo.lock" = "Cargo lock file"
-"src/subcommands.rs" = "Subcommand functions, e.g. init, edit"
 "Cargo.toml" = "Rust project config file"
+src = "Location of source code"
+"src/main.rs" = "Main file containing Sunrise struct"
+"src/subcommands.rs" = "Subcommand functions, e.g. init, edit"
